@@ -1,0 +1,77 @@
+name: Build Open edX image
+
+on:
+  workflow_dispatch:
+    inputs:
+      edx_ref:
+        description: "Branch or tag in this fork to bake into the image"
+        required: true
+        default: "atheniq/verawood"
+      tutor_version:
+        description: "Tutor version whose build recipe to use (must match the deployed release line)"
+        required: true
+        default: "22.0.2"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: openedx-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/innotelinc/openedx-platform
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/lib/node_modules
+          sudo docker image prune -af || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tutor
+        env:
+          TUTOR_VERSION: ${{ inputs.tutor_version }}
+        run: pip install "tutor==${TUTOR_VERSION}"
+
+      - name: Tag this build by the commit it bakes
+        id: meta
+        run: |
+          ref="${{ inputs.edx_ref }}"
+          short="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "$ref" | awk 'NR==1{print substr($1,1,7)}')"
+          if [ -z "$short" ]; then echo "::error::could not resolve $ref in ${GITHUB_REPOSITORY}"; exit 1; fi
+          echo "tag=${short}" >> "$GITHUB_OUTPUT"
+          echo "Building ${ref} at ${short}"
+
+      - name: Render Tutor environment
+        run: tutor config save --set DOCKER_IMAGE_OPENEDX="${IMAGE}:${{ steps.meta.outputs.tag }}"
+
+      - name: Build image from the fork
+        run: |
+          tutor images build openedx \
+            --build-arg EDX_PLATFORM_REPOSITORY="https://github.com/${GITHUB_REPOSITORY}.git" \
+            --build-arg EDX_PLATFORM_VERSION="${{ inputs.edx_ref }}"
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push
+        run: |
+          docker push "${IMAGE}:${{ steps.meta.outputs.tag }}"
+          {
+            echo "### Image pushed"
+            echo
+            echo '```'
+            echo "${IMAGE}:${{ steps.meta.outputs.tag }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
