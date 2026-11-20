@@ -11,6 +11,10 @@ on:
         description: "Tutor version whose build recipe to use (must match the deployed release line)"
         required: true
         default: "22.0.2"
+      theme_ref:
+        description: "Branch of innotelinc/atheniq to take the Unity theme from"
+        required: true
+        default: "main"
 
 permissions:
   contents: read
@@ -22,6 +26,11 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/innotelinc/openedx-platform
+  # The theme is image content, not a deploy step: a stack pinned to this tag must
+  # render with Unity without a follow-up build. Both repos are public, so this needs
+  # no token and adds no secret to the fork.
+  ATHENIQ_REPO: https://github.com/innotelinc/atheniq.git
+  THEME_CONTEXT: /tmp/theme-context
 
 jobs:
   build:
@@ -53,14 +62,70 @@ jobs:
           echo "tag=${short}" >> "$GITHUB_OUTPUT"
           echo "Building ${ref} at ${short}"
 
+      # The theme lives in the AthenIQ repo, beside the plugin that used to patch it
+      # into the Tutor build. Only the COPY sources come across: the theme tree, the
+      # served css/js skin, and the course images the LMS references by path.
+      - name: Fetch the AthenIQ theme
+        id: theme
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.theme_ref }}" "$ATHENIQ_REPO" /tmp/atheniq
+          theme_sha="$(git -C /tmp/atheniq rev-parse --short HEAD)"
+          echo "sha=${theme_sha}" >> "$GITHUB_OUTPUT"
+          echo "theme: ${{ inputs.theme_ref }} at ${theme_sha}"
+
+          mkdir -p "$THEME_CONTEXT/atheniq-theme/lms/static/images"
+          cp -a /tmp/atheniq/contrib/openedx-theme-unity "$THEME_CONTEXT/"
+          cp -a /tmp/atheniq/contrib/atheniq-theme/lms/static/images/courses \
+                "$THEME_CONTEXT/atheniq-theme/lms/static/images/"
+
+          # Fail here, by name, rather than after a 90-minute build.
+          for path in \
+            openedx-theme-unity/lms \
+            openedx-theme-unity/cms \
+            openedx-theme-unity/lms/static/atheniq \
+            openedx-theme-unity/lms/static/images \
+            openedx-theme-unity/cms/static/atheniq \
+            atheniq-theme/lms/static/images/courses
+          do
+            test -e "$THEME_CONTEXT/$path" || { echo "::error::missing theme path $path in ${ATHENIQ_REPO}"; exit 1; }
+          done
+
+      # The build recipe from the release line, with the platform tag set so the result
+      # is distinguishable from the themed image that replaces it.
       - name: Render Tutor environment
-        run: tutor config save --set DOCKER_IMAGE_OPENEDX="${IMAGE}:${{ steps.meta.outputs.tag }}"
+        run: tutor config save --set DOCKER_IMAGE_OPENEDX="${IMAGE}:${{ steps.meta.outputs.tag }}-base"
 
       - name: Build image from the fork
         run: |
           tutor images build openedx \
             --build-arg EDX_PLATFORM_REPOSITORY="https://github.com/${GITHUB_REPOSITORY}.git" \
             --build-arg EDX_PLATFORM_VERSION="${{ inputs.edx_ref }}"
+
+      - name: Layer the Unity theme onto it
+        run: |
+          cat > "$THEME_CONTEXT/Dockerfile" <<'DOCKERFILE'
+          ARG BASE
+          FROM ${BASE}
+          USER root
+          COPY --chown=app:app openedx-theme-unity/lms/ /openedx/themes/unity/lms/
+          COPY --chown=app:app openedx-theme-unity/cms/ /openedx/themes/unity/cms/
+          COPY --chown=app:app openedx-theme-unity/lms/static/atheniq/ /openedx/staticfiles/atheniq/
+          COPY --chown=app:app openedx-theme-unity/lms/static/images/ /openedx/staticfiles/atheniq/images/
+          COPY --chown=app:app atheniq-theme/lms/static/images/courses/ /openedx/staticfiles/atheniq/images/courses/
+          COPY --chown=app:app openedx-theme-unity/cms/static/atheniq/ /openedx/staticfiles/studio/unity/atheniq/
+          USER app
+          DOCKERFILE
+          docker build -f "$THEME_CONTEXT/Dockerfile" \
+            --build-arg BASE="${IMAGE}:${{ steps.meta.outputs.tag }}-base" \
+            -t "${IMAGE}:${{ steps.meta.outputs.tag }}" "$THEME_CONTEXT"
+
+      # The point of building the theme in is that nobody has to check it afterwards,
+      # so the build checks it once, here.
+      - name: Assert the theme is in the image
+        run: |
+          docker run --rm --entrypoint /bin/sh "${IMAGE}:${{ steps.meta.outputs.tag }}" -c \
+            'test -d /openedx/themes/unity/lms && test -d /openedx/staticfiles/atheniq && echo theme-present'
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -74,4 +139,7 @@ jobs:
             echo '```'
             echo "${IMAGE}:${{ steps.meta.outputs.tag }}"
             echo '```'
+            echo
+            echo "edx-platform: ${{ inputs.edx_ref }} at ${{ steps.meta.outputs.tag }}"
+            echo "theme: ${{ inputs.theme_ref }} at ${{ steps.theme.outputs.sha }}"
           } >> "$GITHUB_STEP_SUMMARY"
